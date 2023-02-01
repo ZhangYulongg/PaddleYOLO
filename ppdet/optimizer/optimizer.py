@@ -155,9 +155,14 @@ class PiecewiseDecay(object):
 
 @serializable
 class YOLOv5LRDecay(object):
-    def __init__(self, max_epochs=300, min_lr_ratio=0.01, use_warmup=True):
+    def __init__(self,
+                 max_epochs=300,
+                 min_lr_ratio=0.01,
+                 schedule='linear',
+                 use_warmup=True):
         self.max_epochs = max_epochs
         self.min_lr_ratio = min_lr_ratio
+        self.schedule = schedule
         self.use_warmup = use_warmup
 
     def __call__(self,
@@ -166,7 +171,7 @@ class YOLOv5LRDecay(object):
                  value=None,
                  step_per_epoch=None):
         assert base_lr is not None, "either base LR or values should be provided"
-
+        assert self.schedule in ['linear', 'cosine']
         max_iters = self.max_epochs * int(step_per_epoch)
         warmup_iters = int(boundary[-1])
 
@@ -176,9 +181,14 @@ class YOLOv5LRDecay(object):
             if epoch_i == 2:  # TODO
                 epoch_i = epoch_i + 1
 
-            decayed_lr = base_lr * (
-                (1 - epoch_i / self.max_epochs) *
-                (1.0 - self.min_lr_ratio) + self.min_lr_ratio)
+            if self.schedule == 'linear':
+                decayed_lr = base_lr * (
+                    (1 - epoch_i / self.max_epochs) *
+                    (1.0 - self.min_lr_ratio) + self.min_lr_ratio)
+            else:
+                decayed_lr = base_lr * ((
+                    (1 - math.cos(epoch_i * math.pi / self.max_epochs)) / 2) *
+                                        (self.min_lr_ratio - 1) + 1)
             value.append(decayed_lr)
         return optimizer.lr.PiecewiseDecay(boundary, value)
 

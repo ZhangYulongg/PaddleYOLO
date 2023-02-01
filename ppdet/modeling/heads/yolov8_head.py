@@ -52,15 +52,15 @@ class YOLOv8Head(nn.Layer):
                  nms='MultiClassNMS',
                  eval_size=None,
                  loss_weight={
-                     'class': 1.0,
-                     'iou': 2.5,
-                     'dfl': 0.5,
+                     'class': 0.5,
+                     'iou': 7.5,
+                     'dfl': 0.375,
                  },
                  trt=False,
                  exclude_nms=False,
                  exclude_post_process=False,
                  use_shared_conv=True,
-                 print_l1_loss=True):
+                 print_l1_loss=False):
         super(YOLOv8Head, self).__init__()
         assert len(in_channels) > 0, "len(in_channels) should > 0"
         self.in_channels = in_channels
@@ -86,8 +86,7 @@ class YOLOv8Head(nn.Layer):
         self.use_shared_conv = use_shared_conv
 
         # cls loss
-        self.bce = nn.BCEWithLogitsLoss(
-            pos_weight=paddle.to_tensor([1.0]), reduction="mean")
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
 
         # pred head
         c2 = max((16, in_channels[0] // 4, self.reg_channels * 4))
@@ -127,7 +126,7 @@ class YOLOv8Head(nn.Layer):
             self.proj.reshape([1, self.reg_channels, 1, 1]))
         self.dfl_conv.weight.stop_gradient = True
 
-        # self._init_bias()
+        self._init_bias()
 
     @classmethod
     def from_config(cls, cfg, input_shape):
@@ -135,9 +134,9 @@ class YOLOv8Head(nn.Layer):
 
     def _init_bias(self):
         for a, b, s in zip(self.conv_reg, self.conv_cls, self.fpn_strides):
-            a[-1].bias.set_value(1.0)  # box
-            b[-1].bias[:self.num_classes] = math.log(5 / self.num_classes /
-                                                     (640 / s)**2)
+            a[-1].bias.set_value(a[-1].bias + 1.0)
+            conv_cls_bias = math.log(5 / self.num_classes / (640 / s)**2)
+            b[-1].bias.set_value(b[-1].bias + conv_cls_bias)
 
     def forward(self, feats, targets=None):
         if self.training:
@@ -156,8 +155,8 @@ class YOLOv8Head(nn.Layer):
             reg_distri = self.conv_reg[i](feat)
             cls_logit = self.conv_cls[i](feat)
             # cls and reg
-            cls_score = F.sigmoid(cls_logit)
-            cls_score_list.append(cls_score.flatten(2).transpose([0, 2, 1]))
+            # cls_score = F.sigmoid(cls_logit) # Note diff, sigmoid later
+            cls_score_list.append(cls_logit.flatten(2).transpose([0, 2, 1]))
             reg_distri_list.append(reg_distri.flatten(2).transpose([0, 2, 1]))
         cls_score_list = paddle.concat(cls_score_list, axis=1)
         reg_distri_list = paddle.concat(reg_distri_list, axis=1)
@@ -223,7 +222,9 @@ class YOLOv8Head(nn.Layer):
 
     @staticmethod
     def _varifocal_loss(pred_score, gt_score, label, alpha=0.75, gamma=2.0):
-        weight = alpha * pred_score.pow(gamma) * (1 - label) + gt_score * label
+        # Note diff, sigmoid here
+        weight = alpha * F.sigmoid(pred_score).pow(gamma) * (
+            1 - label) + gt_score * label
         loss = F.binary_cross_entropy(
             pred_score, gt_score, weight=weight, reduction='sum')
         return loss
@@ -234,12 +235,11 @@ class YOLOv8Head(nn.Layer):
         pred_dist = self.dfl_conv(pred_dist.transpose([0, 3, 1, 2])).squeeze(1)
         return batch_distance2bbox(anchor_points, pred_dist)
 
-    def _bbox2distance(self, points, bbox):
+    def _bbox2distance(self, points, bbox, reg_max=15):
         x1y1, x2y2 = paddle.split(bbox, 2, -1)
         lt = points - x1y1
         rb = x2y2 - points
-        return paddle.concat([lt, rb], -1).clip(self.reg_range[0],
-                                                self.reg_range[1] - 1 - 0.01)
+        return paddle.concat([lt, rb], -1).clip(0, reg_max - 0.01)
 
     def _df_loss(self, pred_dist, target, lower_bound=0):
         target_left = paddle.cast(target.floor(), 'int64')
@@ -285,11 +285,12 @@ class YOLOv8Head(nn.Layer):
                 [1, 1, self.reg_channels * 4])
             pred_dist_pos = paddle.masked_select(
                 pred_dist, dist_mask).reshape([-1, 4, self.reg_channels])
-            assigned_ltrb = self._bbox2distance(anchor_points, assigned_bboxes)
+            assigned_ltrb = self._bbox2distance(anchor_points, assigned_bboxes,
+                                                self.reg_channels - 1)
             assigned_ltrb_pos = paddle.masked_select(
                 assigned_ltrb, bbox_mask).reshape([-1, 4])
-            loss_dfl = self._df_loss(pred_dist_pos, assigned_ltrb_pos,
-                                     self.reg_range[0]) * bbox_weight
+            loss_dfl = self._df_loss(pred_dist_pos,
+                                     assigned_ltrb_pos) * bbox_weight
             loss_dfl = loss_dfl.sum() / assigned_scores_sum
         else:
             loss_l1 = paddle.zeros([1])
@@ -310,7 +311,7 @@ class YOLOv8Head(nn.Layer):
         # label assignment
         assigned_labels, assigned_bboxes, assigned_scores = \
             self.assigner(
-            pred_scores.detach(),
+            F.sigmoid(pred_scores.detach()),
             pred_bboxes.detach() * stride_tensor,
             anchor_points,
             num_anchors_list,
@@ -327,31 +328,37 @@ class YOLOv8Head(nn.Layer):
             loss_cls = self._varifocal_loss(pred_scores, assigned_scores,
                                             one_hot_label)
         else:
-            loss_cls = self.bce(pred_scores, assigned_scores)
+            loss_cls = self.bce(pred_scores, assigned_scores).sum()
 
         assigned_scores_sum = assigned_scores.sum()
         if paddle.distributed.get_world_size() > 1:
             paddle.distributed.all_reduce(assigned_scores_sum)
             assigned_scores_sum /= paddle.distributed.get_world_size()
         assigned_scores_sum = paddle.clip(assigned_scores_sum, min=1.)
-        # loss_cls /= assigned_scores_sum
+
+        loss_cls /= assigned_scores_sum
 
         loss_l1, loss_iou, loss_dfl = \
             self._bbox_loss(pred_distri, pred_bboxes, anchor_points_s,
-                            assigned_labels, assigned_bboxes, assigned_scores,
-                            assigned_scores_sum)
-        loss = self.loss_weight['class'] * loss_cls + \
-               self.loss_weight['iou'] * loss_iou + \
-               self.loss_weight['dfl'] * loss_dfl
+                            assigned_labels, assigned_bboxes, assigned_scores, assigned_scores_sum)
+
+        loss_cls *= self.loss_weight['class']
+        loss_iou *= self.loss_weight['iou']
+        loss_dfl *= self.loss_weight['dfl']
+        loss_total = loss_cls + loss_iou + loss_dfl
+        bs = head_outs[0].shape[0]
+        num_gpus = gt_meta.get('num_gpus', 8)
+        total_bs = bs * num_gpus
+
         out_dict = {
-            'loss': loss,
-            'loss_cls': loss_cls,
-            'loss_iou': loss_iou,
-            'loss_dfl': loss_dfl,
+            'loss': loss_total * total_bs,
+            'loss_cls': loss_cls * total_bs,
+            'loss_iou': loss_iou * total_bs,
+            'loss_dfl': loss_dfl * total_bs,
         }
         if self.print_l1_loss:
             # just see convergence
-            out_dict.update({'loss_l1': loss_l1})
+            out_dict.update({'loss_l1': loss_l1 * total_bs})
         return out_dict
 
     def post_process(self, head_outs, im_shape, scale_factor):

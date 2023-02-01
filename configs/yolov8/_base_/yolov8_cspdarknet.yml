@@ -26,7 +26,7 @@ YOLOv8CSPDarkNet:
 
 YOLOv8Head:
   fpn_strides: [8, 16, 32]
-  loss_weight: {class: 0.5, iou: 7.5, dfl: 1.5}
+  loss_weight: {class: 0.5, iou: 7.5, dfl: 0.375}
   assigner:
     name: TaskAlignedAssigner
     topk: 10
